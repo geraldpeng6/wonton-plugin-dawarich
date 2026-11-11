@@ -1,12 +1,17 @@
 # shellcheck shell=bash
 # scripts/smoke.sh 的一项一项探测。页面特征、身份、数据都走真实的应用接口。
 
-# 真实冒烟（e2e/smoke.sh）给的是 SMOKE_WEB_URL（网页入口完整地址，含路径），
-# 模板 dev 探针给的是 SMOKE_WEB_ORIGIN；统一成源地址（scheme://host:port）往下用。
-if [[ -n "${SMOKE_WEB_URL:-}" ]]; then
-  _o="${SMOKE_WEB_URL#*://}"
-  SMOKE_WEB_ORIGIN="${SMOKE_WEB_URL%%"$_o"}${_o%%/*}"
-fi
+# 源地址（scheme://host:port）：真实冒烟（e2e/smoke.sh）给的是 SMOKE_WEB_URL（网页入口
+# 完整地址，含路径），模板 dev 探针给的是 SMOKE_WEB_ORIGIN；后者没有就从前者切。
+# 探针文件被 source 时这两个变量可能都还没设（框架是逐项探测时才注入的），所以现取现用。
+_smoke_origin() {
+  if [[ -n "${SMOKE_WEB_ORIGIN:-}" ]]; then
+    printf '%s' "$SMOKE_WEB_ORIGIN"
+    return
+  fi
+  local tail="${SMOKE_WEB_URL#*://}"
+  printf '%s' "${SMOKE_WEB_URL%%"$tail"}${tail%%/*}"
+}
 
 # 页面：SSO 登录后落到应用的时间线/地图页，标题带 Dawarich。
 web_assert() { grep -qi '<title>[^<]*dawarich'; }
@@ -101,7 +106,7 @@ _app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hyd
     page="$(dweb /users/sign_in -L -H 'Accept: text/html')" || { echo "登录页请求失败"; return 1; }
     form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
     [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
-    url="$SMOKE_WEB_ORIGIN/users/auth/openid_connect"
+    url="$(_smoke_origin)/users/auth/openid_connect"
     for _ in 1 2 3 4 5 6 7 8; do
       out="$(curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
         -H 'Accept: text/html' --data "$form" -w '\n%{url_effective}' "$url")" ||
@@ -149,7 +154,7 @@ data_write() {
   lon="12.6${RANDOM}2"
   body="$(printf '{"locations":[{"type":"Feature","geometry":{"type":"Point","coordinates":[%s,%s]},"properties":{"timestamp":1700000123,"device_id":"%s"}}]}' "$lon" "$lat" "$marker")"
   code="$(curl -sS --noproxy '*' -m 30 -b "$SMOKE_JAR" -H 'Content-Type: application/json' -d "$body" \
-    -o /dev/null -w '%{http_code}' "$SMOKE_WEB_ORIGIN/api/v1/points?api_key=$key")" ||
+    -o /dev/null -w '%{http_code}' "$(_smoke_origin)/api/v1/points?api_key=$key")" ||
     { echo "请求失败：$code"; return 1; }
   [[ "$code" == 2* ]] || { echo "写点失败：POST /api/v1/points 返回 $code"; return 1; }
   printf '%s' "$marker" >"$SMOKE_STATE"
@@ -161,6 +166,6 @@ data_check() {
   marker="$(cat "$SMOKE_STATE")"
   [[ -n "$marker" ]] || { echo "标记为空"; return 1; }
   curl -sS --noproxy '*' -m 30 -b "$SMOKE_JAR" \
-    "$SMOKE_WEB_ORIGIN/api/v1/points?api_key=$key&per_page=10000" | grep -qF "$marker" ||
+    "$(_smoke_origin)/api/v1/points?api_key=$key&per_page=10000" | grep -qF "$marker" ||
     { echo "points 列表里没有标记 $marker"; return 1; }
 }
