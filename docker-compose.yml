@@ -29,10 +29,20 @@ services:
       SIDEKIQ_EMBEDDED: "true"
       WEB_CONCURRENCY: "0"
       # OIDC：回调地址必须和核心登记的完全一致（插件网页地址 + 登录回调路径）。
+      # 上游的发现模式拿不到核心的 http 签发方（它依赖的 gem 对发现请求硬编码 https，见 PR），
+      # 走手册端点模式：三类端点都用核心注入的绝对地址（gem 对绝对地址原样保留），
+      # 授权端点是浏览器地址，令牌、用户信息和 JWKS 在插件网络里解析。
       OIDC_CLIENT_ID: ${WONTON_OIDC_CLIENT_ID}
       OIDC_CLIENT_SECRET: ${WONTON_OIDC_CLIENT_SECRET}
       OIDC_ISSUER: ${WONTON_OIDC_ISSUER}
       OIDC_REDIRECT_URI: ${WONTON_APP_URL}/users/auth/openid_connect/callback
+      OIDC_DISCOVERY: "false"
+      OIDC_HOST: auth.wonton.internal
+      OIDC_SCHEME: http
+      OIDC_AUTHORIZATION_ENDPOINT: ${WONTON_OIDC_AUTH_URL}
+      OIDC_TOKEN_ENDPOINT: ${WONTON_OIDC_TOKEN_URL}
+      OIDC_USERINFO_ENDPOINT: ${WONTON_OIDC_USERINFO_URL}
+      OIDC_JWKS_URI: ${WONTON_OIDC_ISSUER}/.well-known/jwks.json
       # 上游默认就不开放邮箱注册（OIDC 以外的建号路），保持默认；登录表单保留，账号口令无人知道。
       # 找回密码等应用自己的邮件走核心的 SMTP（不加密、不 STARTTLS）。
       SMTP_SERVER: ${WONTON_SMTP_HOST}
@@ -172,12 +182,12 @@ x-wonton:
   webui:
     service: app
     port: 3000
-    # 直接落到应用的 OIDC 起点，登录在核心身份提供方完成，不用再点一次“Sign in”。
-    path: /users/auth/openid_connect
+    # omniauth 2.x 的 OIDC 请求段只收 POST，没有可直接 GET 打开的登录起点，入口落在登录页（一键“Sign in with Openid Connect”）。
+    path: /users/sign_in
     sso: oidc
     oidc:
       redirect_paths: [/users/auth/openid_connect/callback]
-  # 上游自带只读 MCP（/api/v1/mcp，Bearer 认证用接口密钥）；密钥由主人在插件详情里填。
+  # 上游自带只读 MCP（/api/v1/mcp，Bearer 认证）；密钥是主人账号的接口密钥，一次性服务写进文件、核心收存。
   mcp:
     service: app
     port: 3000

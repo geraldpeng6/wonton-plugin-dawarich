@@ -12,30 +12,100 @@ mcp_assert() {
   grep -q '"point"' && ! grep -q '"isError":true'
 }
 
-identity_check() { # 设置页（Account）显示主人邮箱：<用户名>@wonton.internal
+identity_check() { # 设置的用户列表只有管理员看得见，页面上有主人邮箱和 Admin 徽标
   local page
   page="$(_authorized_page /settings/users)" || { echo "页面失败"; return 1; }
-  grep -qF "${SMOKE_OWNER}@wonton.internal" <<<"$page" ||
-    { echo "设置页没显示主人邮箱 ${SMOKE_OWNER}@wonton.internal：$(head -c 200 <<<"$page")"; return 1; }
+  grep -qF "${SMOKE_OWNER}@" <<<"$page" ||
+    { echo "用户列表没显示主人邮箱（${SMOKE_OWNER}@…）：$(head -c 150 <<<"$page")"; return 1; }
+  grep -q '>Admin<' <<<"$page" ||
+    { echo "用户列表里没有 Admin 徽标：$(head -c 150 <<<"$page")"; return 1; }
 }
 
-# 应用会话要经 OIDC 建立过才有：先普通请求，拿到的是登录页就带 --sso 从 webui.path 走一遍登录链。
+# 应用会话要经 OIDC 建立过才有。omniauth 2.x 的 OIDC 请求段只收 POST，核心的 --sso 自动表单
+# 会撞上排在前面、字段为空的邮箱登录表单，所以这里自己解析按钮表单提交，再跟完跳转链。
 _authorized_page() {
   local page
-  page="$(dweb "$1")" || return 1
-  if grep -qi 'sign in' <<<"$page"; then
-    page="$(dweb --sso "$1")" || return 1
+  page="$(dweb "$1" -L)" || { echo "页面失败：$1"; return 1; }
+  if grep -q 'action="/users/auth/openid_connect"' <<<"$page"; then
+    _app_sso_login || return 1
+    page="$(dweb "$1" -L)" || { echo "页面失败：$1"; return 1; }
   fi
   printf '%s' "$page"
 }
 
-# 数据：按设置页复制按钮里的接口密钥调应用自己的 API（过网关带核心会话 cookie）。
+# 标准输入是页面：输出第一个（可选 $1 匹配 action 子串）带隐藏字段的 POST 表单的 urlencoded 字段。
+_form_post_data() {
+  python3 -c '
+import html.parser, sys
+from urllib.parse import urlencode
+
+want = sys.argv[1] if len(sys.argv) > 1 else ""
+
+class Forms(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.cur = None
+        self.forms = []
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form" and self.cur is None:
+            self.cur = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "fields": []}
+        elif tag == "input" and self.cur is not None and a.get("name") and a.get("type", "text").lower() == "hidden":
+            self.cur["fields"].append((a["name"], a.get("value", "")))
+    def handle_endtag(self, tag):
+        if tag == "form" and self.cur is not None:
+            self.forms.append(self.cur)
+            self.cur = None
+
+p = Forms()
+p.feed(sys.stdin.read())
+for f in p.forms:
+    if f["method"] == "post" and f["fields"] and want in f["action"]:
+        print(urlencode(f["fields"]))
+        break
+' "$1"
+}
+
+_app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hydra 的跳转链；链上遇到隐藏字段自动表单就照提交。
+  local page form out url
+  page="$(dweb /users/sign_in)" || { echo "登录页请求失败"; return 1; }
+  form="$(_form_post_data 'action="/users/auth/openid_connect"' <<<"$page")"
+  [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
+  url="$SMOKE_WEB_ORIGIN/users/auth/openid_connect"
+  for _ in 1 2 3 4 5 6 7 8; do
+    out="$(curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+      -H 'Accept: text/html' --data "$form" -w '\n%{url_effective}' "$url")" ||
+      { echo "OIDC 跳转请求失败"; return 1; }
+    url="${out##*$'\n'}"
+    page="${out%$'\n'*}"
+    form="$(_form_post_data <<<"$page")"
+    [[ -n "$form" ]] || break
+  done
+  grep -qi '<title>[^<]*dawarich' <<<"$page" ||
+    { echo "OIDC 登录没落到应用页面：$(head -c 150 <<<"$page" | tr '\n' ' ')"; return 1; }
+}
+
+# 数据：按设置里主人那行的接口密钥调应用自己的 API（过网关带核心会话 cookie）。
 # data_write 写一个带随机标记（device_id）的点，data_check 从 points 列表里找回这个标记。
+_owner_page() { # 主人在用户列表里的详情页（接口密钥在这里）
+  local index url
+  index="$(_authorized_page /settings/users)" || { echo "$index"; return 1; }
+  url="$(SMOKE_OWNER="${SMOKE_OWNER:-}" python3 -c '
+import os, re, sys
+t = sys.stdin.read()
+owner = os.environ.get("SMOKE_OWNER", "")
+m = re.search(r"href=\"(/settings/users/\d+)\"[^>]*>[^<]*" + re.escape(owner) + "@", t)
+print(m.group(1) if m else "")
+' <<<"$index")"
+  [[ -n "$url" ]] || { echo "用户列表里找不到主人（${SMOKE_OWNER}@…）"; return 1; }
+  dweb "$url" -L
+}
+
 _api_key() {
   local page key
-  page="$(_authorized_page /settings/users)" || { echo "设置页请求失败"; return 1; }
+  page="$(_owner_page)" || { echo "$page"; return 1; }
   key="$(grep -o 'data-clipboard-text-value="[^"]*"' <<<"$page" | head -1 | sed 's/.*="//; s/"$//')"
-  [[ "$key" =~ ^[0-9a-f]{32,128}$ ]] || { echo "设置页上取不到接口密钥：$(head -c 200 <<<"$page")"; return 1; }
+  [[ "$key" =~ ^[0-9a-f]{32,128}$ ]] || { echo "主人页上取不到接口密钥：$(head -c 150 <<<"$page")"; return 1; }
   printf '%s' "$key"
 }
 
