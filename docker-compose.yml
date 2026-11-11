@@ -154,7 +154,7 @@ x-wonton:
   description: { zh: 像谷歌地图的时间线，手机自动记录你去过哪里，网页上看轨迹和统计, en: "Like Google Maps Timeline: your phone reports where you have been, and you browse tracks and stats on the web" }
   icon: icon.png
   notices: [NOTICE]
-  screenshots: [screenshots/map.png]
+  screenshots: [screenshots/map.png, screenshots/timeline.png]
   author: { name: geraldpeng6 }
   homepage: https://dawarich.app
   # 上游应用的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
