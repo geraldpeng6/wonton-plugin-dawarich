@@ -1,43 +1,28 @@
-# 云吞插件模板
+# Dawarich（自己的位置时间线）
 
-开发流程见[插件开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md)。
+像谷歌地图的时间线：手机后台上报位置，网页上看去过哪里、轨迹和统计，数据都在自己家里。上游是 [Dawarich](https://dawarich.app)（AGPL-3.0）。
 
-这是一个能安装的示例插件 `app.example.hello`：使用 nginx 官方镜像显示问候页，经网关的 `sso: proxy` 注入用户名，页面显示“你好，<用户名>”。示例没有应用账号、持久化数据或 MCP 工具。
+装好后打开网页就能用，登录走云吞的身份提供方，首次登录自动建好管理员账号。手机装 Dawarich 官方 App（或 OwnTracks、Overland 这类定位应用），把网页 Account 页里的接口密钥填进去就能自动上报；谷歌时间线导出的数据可以导入。
 
-## 示例文件
+## 使用
 
-| 路径 | 内容 |
-| --- | --- |
-| `docker-compose.yml` | 示例清单、nginx 服务和三个 `configs` |
-| `web/default.conf.template` | nginx 配置，启用 SSI 回显用户名并提供健康检查入口；只放行来自核心地址（`${WONTON_CORE_ADDRESS}`）的请求，其余来源 403 |
-| `web/index.html` | 问候页 |
-| `web/tokens.css` | 页面主题变量的后备值 |
-| `tabs/` | 示例主页的应用页面图标 |
-| `screenshots/home.png` | 商店详情页的示例截图 |
-| `scripts/smoke-probes.sh` | 检查真实页面和网关注入身份的插件探针 |
+- **网页**：地图、时间线、统计、导入导出都在网页里；家人也可以登录，各看各的时间线。
+- **手机上报**：手机和服务器在同一网络时可用。**出门在外（手机不在家里网络）暂时连不上服务器**，位置不会上报，回来后 App 会把攒下的点补传（上游 App 支持离线缓存）。等云吞提供插件公网入口后不需要这个限制。
+- **Agent**：上游自带只读 MCP 服务（查时间线、最近位置、找去过的地点），装好即可用，密钥插件自己从应用拿。以后在应用里重新生成密钥的话，重建容器（或重启服务器）后 Agent 才会拿到新密钥。
+- **地图瓦片**：从公网地图服务加载（OpenStreetMap 等），网页要能上外网才显示地图；国内看到的地图有 GCJ-02 偏移，本插件不做纠偏。
+- **反向地理编码**：默认用公共 Photon 服务（photon.komoot.io，每秒 1 次），在应用设置里可以换成自己部署的 Photon 或其他服务商。
 
-从模板创建自己的插件后，替换示例清单、网页和素材；具体步骤见[写插件](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件)。
+## 权限
 
-## 对着别的栈跑探针
-
-`probes`、`api`、`session` 按 `.wonton/.env` 的 `WONTON_BASE_DOMAIN` 拼核心地址，`up` 起的栈自己写这个键。插件装进别人的栈、或者对着已有环境排查时，把那套栈的基础域名写进 `.wonton/.env`，不要只按实例名猜地址：实例名只是资源名前缀，网关按 Host 认域名，拼错了会回“没有安装”。
-
-```bash
-WONTON_BASE_DOMAIN=wonton.localhost
-```
-
-## 核心镜像
-
-检查和冒烟默认用套件里的核心镜像（`ghcr.io/wontonapp/wonton-core:main`）；要固定别的核心镜像，在仓库 Settings → Variables 设 `WONTON_CORE_IMAGE`，手动触发“检查”时填的 `core-image` 输入优先。
-
-## 更新开发套件
-
-```bash
-scripts/dev.sh kit-update
-```
-
-在从模板新建的插件仓库中更新套件；本仓库是套件源头，执行时只提示并退出。版本、可选引用和自定义脚本约定见[开发指南](https://github.com/wontonapp/wonton-docs/blob/main/develop.md#更新开发套件)。
+- `network.egress`：反向地理编码、Immich/PhotoPrism 集成、S3 存储后端和外发邮件要连外网；地图瓦片是浏览器直接加载的，不经容器。
+- `notify`：应用自己的邮件（找回密码等）经核心的 SMTP 发进家里的聊天。
+- `owner.identity`：首次启动要用注入的用户名和邮箱建主人的管理员账号。
 
 ## 图标
 
-`icon.svg` 是本仓库原创线条图标，按本仓库 MIT 许可证分发，见 [NOTICE](NOTICE)。
+`icon.png` 用上游 Dawarich 标志（来源、许可全文和商标说明见 [NOTICE](NOTICE)）。
+
+## 排错
+
+- 网页打不开：`scripts/dev.sh status` 看应用是否 healthy；装完第一次要等建库和迁移。
+- 手机连不上：确认手机和服务器在同一网络，接口密钥填的是 Account 页的值。
