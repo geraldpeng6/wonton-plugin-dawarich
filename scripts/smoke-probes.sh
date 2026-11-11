@@ -14,11 +14,20 @@ mcp_assert() {
 
 identity_check() { # 设置的用户列表只有管理员看得见，页面上有主人邮箱和 Admin 徽标
   local page
-  page="$(_authorized_page /settings/users)" || { echo "页面失败"; return 1; }
+  page="$(_authorized_page /settings/users)" || { echo "${page:-页面失败}"; return 1; }
   grep -qF "${SMOKE_OWNER}@" <<<"$page" ||
     { echo "用户列表没显示主人邮箱（${SMOKE_OWNER}@…）：$(head -c 150 <<<"$page")"; return 1; }
   grep -q '>Admin<' <<<"$page" ||
     { echo "用户列表里没有 Admin 徽标：$(head -c 150 <<<"$page")"; return 1; }
+}
+
+# 应用会话经 OIDC 建立后才有效。冒烟框架默认的 web_login 只走到应用登录页；
+# omniauth 2.x 的 OIDC 请求段只收 POST，这里补上提交表单、跟完跳转链这一段。
+web_login() {
+  local page
+  page="$(dweb /settings/users -L)" || { echo "页面请求失败：/settings/users"; return 1; }
+  grep -q 'action="/users/auth/openid_connect"' <<<"$page" || return 0 # 已有应用会话
+  _app_sso_login
 }
 
 # 应用会话要经 OIDC 建立过才有。omniauth 2.x 的 OIDC 请求段只收 POST，核心的 --sso 自动表单
@@ -69,7 +78,7 @@ for f in p.forms:
 _app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hydra 的跳转链；链上遇到隐藏字段自动表单就照提交。
   local page form out url
   page="$(dweb /users/sign_in)" || { echo "登录页请求失败"; return 1; }
-  form="$(_form_post_data 'action="/users/auth/openid_connect"' <<<"$page")"
+  form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
   [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
   url="$SMOKE_WEB_ORIGIN/users/auth/openid_connect"
   for _ in 1 2 3 4 5 6 7 8; do
