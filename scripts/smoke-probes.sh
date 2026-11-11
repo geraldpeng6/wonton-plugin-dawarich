@@ -1,6 +1,13 @@
 # shellcheck shell=bash
 # scripts/smoke.sh 的一项一项探测。页面特征、身份、数据都走真实的应用接口。
 
+# 真实冒烟（e2e/smoke.sh）给的是 SMOKE_WEB_URL（网页入口完整地址，含路径），
+# 模板 dev 探针给的是 SMOKE_WEB_ORIGIN；统一成源地址（scheme://host:port）往下用。
+if [[ -n "${SMOKE_WEB_URL:-}" ]]; then
+  _o="${SMOKE_WEB_URL#*://}"
+  SMOKE_WEB_ORIGIN="${SMOKE_WEB_URL%%"$_o"}${_o%%/*}"
+fi
+
 # 页面：SSO 登录后落到应用的时间线/地图页，标题带 Dawarich。
 web_assert() { grep -qi '<title>[^<]*dawarich'; }
 
@@ -25,7 +32,8 @@ identity_check() { # 设置的用户列表只有管理员看得见，页面上�
 # omniauth 2.x 的 OIDC 请求段只收 POST，这里补上提交表单、跟完跳转链这一段。
 web_login() {
   local page
-  page="$(dweb /settings/users -L)" || { echo "页面请求失败：/settings/users"; return 1; }
+  # 带 Accept: text/html：应用会话缺失时网关才会起 SSO 跳转（跟着 -L 走完），而不是直接 401。
+  page="$(dweb /settings/users -L -H 'Accept: text/html')" || { echo "页面请求失败：/settings/users"; return 1; }
   grep -q 'action="/users/auth/openid_connect"' <<<"$page" || return 0 # 已有应用会话
   _app_sso_login
 }
@@ -34,15 +42,18 @@ web_login() {
 # 会撞上排在前面、字段为空的邮箱登录表单，所以这里自己解析按钮表单提交，再跟完跳转链。
 _authorized_page() {
   local page
-  page="$(dweb "$1" -L)" || { echo "页面失败：$1"; return 1; }
+  # Accept: text/html 的原因见 web_login：会话缺了让网关起 SSO 跳转，别吃 401。
+  page="$(dweb "$1" -L -H 'Accept: text/html')" || { echo "页面失败：$1"; return 1; }
   if grep -q 'action="/users/auth/openid_connect"' <<<"$page"; then
     _app_sso_login || return 1
-    page="$(dweb "$1" -L)" || { echo "页面失败：$1"; return 1; }
+    page="$(dweb "$1" -L -H 'Accept: text/html')" || { echo "页面失败：$1"; return 1; }
   fi
   printf '%s' "$page"
 }
 
-# 标准输入是页面：输出第一个（可选 $1 匹配 action 子串）带隐藏字段的 POST 表单的 urlencoded 字段。
+# 标准输入是页面：输出第一个（可选 $1 匹配 action 子串）自动提交型 POST 表单的 urlencoded 字段。
+# 只认字段全是 hidden 的表单：跳转链上要跟的是无 JS 就不动的自动提交表单；
+# 应用页面上的普通表单（有文本框、按钮的）不能抓来重发。
 _form_post_data() {
   python3 -c '
 import html.parser, sys
@@ -58,9 +69,18 @@ class Forms(html.parser.HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "form" and self.cur is None:
-            self.cur = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "fields": []}
-        elif tag == "input" and self.cur is not None and a.get("name") and a.get("type", "text").lower() == "hidden":
-            self.cur["fields"].append((a["name"], a.get("value", "")))
+            self.cur = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "fields": [], "extra": False}
+        elif tag == "input" and self.cur is not None and a.get("name"):
+            if a.get("type", "text").lower() == "hidden":
+                self.cur["fields"].append((a["name"], a.get("value", "")))
+            else:
+                self.cur["extra"] = True
+        elif tag in ("select", "textarea") and self.cur is not None:
+            self.cur["extra"] = True
+        elif tag == "button" and self.cur is not None and not want:
+            # 裸调用（跟跳转链）只要纯 hidden 的自动提交表单；显式给了 action 子串才认带按钮的表单
+            # （登录页的 OIDC 入口表单有按钮，登出之类的表单不能抓来重发）。
+            self.cur["extra"] = True
     def handle_endtag(self, tag):
         if tag == "form" and self.cur is not None:
             self.forms.append(self.cur)
@@ -69,29 +89,32 @@ class Forms(html.parser.HTMLParser):
 p = Forms()
 p.feed(sys.stdin.read())
 for f in p.forms:
-    if f["method"] == "post" and f["fields"] and want in f["action"]:
+    if f["method"] == "post" and f["fields"] and not f["extra"] and want in f["action"]:
         print(urlencode(f["fields"]))
         break
-' "$1"
+' "${1:-}"
 }
 
 _app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hydra 的跳转链；链上遇到隐藏字段自动表单就照提交。
   local page form out url
-  page="$(dweb /users/sign_in)" || { echo "登录页请求失败"; return 1; }
-  form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
-  [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
-  url="$SMOKE_WEB_ORIGIN/users/auth/openid_connect"
-  for _ in 1 2 3 4 5 6 7 8; do
-    out="$(curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
-      -H 'Accept: text/html' --data "$form" -w '\n%{url_effective}' "$url")" ||
-      { echo "OIDC 跳转请求失败"; return 1; }
-    url="${out##*$'\n'}"
-    page="${out%$'\n'*}"
-    form="$(_form_post_data <<<"$page")"
-    [[ -n "$form" ]] || break
+  for _attempt in 1 2; do
+    page="$(dweb /users/sign_in -L -H 'Accept: text/html')" || { echo "登录页请求失败"; return 1; }
+    form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
+    [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
+    url="$SMOKE_WEB_ORIGIN/users/auth/openid_connect"
+    for _ in 1 2 3 4 5 6 7 8; do
+      out="$(curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+        -H 'Accept: text/html' --data "$form" -w '\n%{url_effective}' "$url")" ||
+        { echo "OIDC 跳转请求失败"; return 1; }
+      url="${out##*$'\n'}"
+      page="${out%$'\n'*}"
+      form="$(_form_post_data <<<"$page")"
+      [[ -n "$form" ]] || break
+    done
+    grep -qi '<title>[^<]*dawarich' <<<"$page" && return 0
+    # 跳转链偶尔会撞上一次性的状态（再走一遍是全新会话），最后一遍的报错才作数。
+    ((_attempt < 2)) || { echo "OIDC 登录没落到应用页面：$(head -c 150 <<<"$page" | tr '\n' ' ')"; return 1; }
   done
-  grep -qi '<title>[^<]*dawarich' <<<"$page" ||
-    { echo "OIDC 登录没落到应用页面：$(head -c 150 <<<"$page" | tr '\n' ' ')"; return 1; }
 }
 
 # 数据：按设置里主人那行的接口密钥调应用自己的 API（过网关带核心会话 cookie）。
