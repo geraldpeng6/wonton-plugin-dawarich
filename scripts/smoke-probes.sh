@@ -16,6 +16,13 @@ _smoke_origin() {
 # 页面：SSO 登录后落到应用的时间线/地图页，标题带 Dawarich。
 web_assert() { grep -qi '<title>[^<]*dawarich'; }
 
+# GET 页面：带会话、把 Set-Cookie 写回会话文件。不用框架的 dweb——各冒烟实现里它不一定
+# 写回 cookie，而登录表单的 CSRF 令牌跟着会话走，取表单的请求必须把新会话存下来。
+_fetch_page() {
+  curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    -H 'Accept: text/html' "$(_smoke_origin)$1"
+}
+
 # 工具：上游自带的只读 MCP。get_latest_location 空库时也返回 {"point":null}，不依赖数据。
 export MCP_TOOL=get_latest_location
 export MCP_ARGS={}
@@ -37,8 +44,7 @@ identity_check() { # 设置的用户列表只有管理员看得见，页面上�
 # omniauth 2.x 的 OIDC 请求段只收 POST，这里补上提交表单、跟完跳转链这一段。
 web_login() {
   local page
-  # 带 Accept: text/html：应用会话缺失时网关才会起 SSO 跳转（跟着 -L 走完），而不是直接 401。
-  page="$(dweb /settings/users -L -H 'Accept: text/html')" || { echo "页面请求失败：/settings/users"; return 1; }
+  page="$(_fetch_page /settings/users)" || { echo "页面请求失败：/settings/users"; return 1; }
   grep -q 'action="/users/auth/openid_connect"' <<<"$page" || return 0 # 已有应用会话
   _app_sso_login
 }
@@ -47,11 +53,10 @@ web_login() {
 # 会撞上排在前面、字段为空的邮箱登录表单，所以这里自己解析按钮表单提交，再跟完跳转链。
 _authorized_page() {
   local page
-  # Accept: text/html 的原因见 web_login：会话缺了让网关起 SSO 跳转，别吃 401。
-  page="$(dweb "$1" -L -H 'Accept: text/html')" || { echo "页面失败：$1"; return 1; }
+  page="$(_fetch_page "$1")" || { echo "页面失败：$1"; return 1; }
   if grep -q 'action="/users/auth/openid_connect"' <<<"$page"; then
     _app_sso_login || return 1
-    page="$(dweb "$1" -L -H 'Accept: text/html')" || { echo "页面失败：$1"; return 1; }
+    page="$(_fetch_page "$1")" || { echo "页面失败：$1"; return 1; }
   fi
   printf '%s' "$page"
 }
@@ -103,7 +108,7 @@ for f in p.forms:
 _app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hydra 的跳转链；链上遇到隐藏字段自动表单就照提交。
   local page form out url
   for _attempt in 1 2; do
-    page="$(dweb /users/sign_in -L -H 'Accept: text/html')" || { echo "登录页请求失败"; return 1; }
+    page="$(_fetch_page /users/sign_in)" || { echo "登录页请求失败"; return 1; }
     form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
     [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
     url="$(_smoke_origin)/users/auth/openid_connect"
@@ -135,7 +140,7 @@ m = re.search(r"href=\"(/settings/users/\d+)\"[^>]*>[^<]*" + re.escape(owner) + 
 print(m.group(1) if m else "")
 ' <<<"$index")"
   [[ -n "$url" ]] || { echo "用户列表里找不到主人（${SMOKE_OWNER}@…）"; return 1; }
-  dweb "$url" -L
+  _fetch_page "$url"
 }
 
 _api_key() {
