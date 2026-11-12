@@ -31,6 +31,18 @@ mcp_assert() {
   grep -q '"point"' && ! grep -q '"isError":true'
 }
 
+# 框架的默认 mcp_check 在 e2e 里跑不通；这里照它的默认分支自己调一次只读工具。
+# probes_mcp 在调用前已备好 SMOKE_MCP_URL（Hermes 总线）和 mcp 函数。
+mcp_check() {
+  local tool out
+  tool="$MCP_TOOL"
+  grep -q "__" <<<"$tool" || tool="${SMOKE_SLUG:-}__${tool}"
+  out="$(mcp call "$SMOKE_MCP_URL" "$tool" "$MCP_ARGS" 2>&1)" ||
+    { echo "调用只读工具 $tool 失败：$(head -c 300 <<<"$out" | tr '\n' ' ')"; return 1; }
+  mcp_assert <<<"$out" ||
+    { echo "$tool 的结果不符合预期：$(head -c 200 <<<"$out" | tr '\n' ' ')"; return 1; }
+}
+
 identity_check() { # 设置的用户列表只有管理员看得见，页面上有主人邮箱和 Admin 徽标
   local page
   page="$(_authorized_page /settings/users)" || { echo "${page:-页面失败}"; return 1; }
