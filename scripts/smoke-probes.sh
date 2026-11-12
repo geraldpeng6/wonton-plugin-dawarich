@@ -24,23 +24,29 @@ _fetch_page() {
 }
 
 # 工具：上游自带的只读 MCP。get_latest_location 空库时也返回 {"point":null}，不依赖数据。
-export MCP_TOOL=get_latest_location
+# 工具名带全前缀（总线用清单 id 换成连字符的 slug），不依赖框架给的插件前缀变量。
+export MCP_TOOL=app-dawarich-dawarich__get_latest_location
 export MCP_ARGS={}
 
 mcp_assert() {
   grep -q '"point"' && ! grep -q '"isError":true'
 }
 
-# 框架的默认 mcp_check 在 e2e 里跑不通；这里照它的默认分支自己调一次只读工具。
-# probes_mcp 在调用前已备好 SMOKE_MCP_URL（Hermes 总线）和 mcp 函数。
+# 框架的默认 mcp_check 在 e2e 里跑不通，SMOKE_MCP_URL/SMOKE_SLUG 也不在它的变量契约里；
+# 这里按标签找 Hermes 的 gateway 容器（e2e 一定装了 Hermes），用它的总线地址真实调一次。
+# scripts/mcp_client.py 是开发套件随仓库带的 MCP 客户端，gateway 镜像里有它要的 SDK。
 mcp_check() {
-  local tool out
-  tool="$MCP_TOOL"
-  grep -q "__" <<<"$tool" || tool="${SMOKE_SLUG:-}__${tool}"
-  out="$(mcp call "$SMOKE_MCP_URL" "$tool" "$MCP_ARGS" 2>&1)" ||
-    { echo "调用只读工具 $tool 失败：$(head -c 300 <<<"$out" | tr '\n' ' ')"; return 1; }
+  local gw url out
+  gw="$(docker ps --filter "label=wonton.instance=${SMOKE_INSTANCE:-}" --format '{{.Names}}' \
+    | grep -F "com-nousresearch-hermes--gateway" | head -1)"
+  [[ -n "$gw" ]] || { echo "找不到 Hermes 的 gateway 容器（wonton.instance=${SMOKE_INSTANCE:-}）"; return 1; }
+  url="$(docker exec "$gw" printenv WONTON_MCP_URL 2>/dev/null)" ||
+    { echo "gateway 容器（$gw）里没有 WONTON_MCP_URL"; return 1; }
+  out="$(docker exec -i "$gw" python3 - call "$url" "$MCP_TOOL" "$MCP_ARGS" \
+    <"$(dirname "${BASH_SOURCE[0]}")/mcp_client.py" 2>&1)" ||
+    { echo "调用只读工具 $MCP_TOOL 失败：$(head -c 300 <<<"$out" | tr '\n' ' ')"; return 1; }
   mcp_assert <<<"$out" ||
-    { echo "$tool 的结果不符合预期：$(head -c 200 <<<"$out" | tr '\n' ' ')"; return 1; }
+    { echo "$MCP_TOOL 的结果不符合预期：$(head -c 200 <<<"$out" | tr '\n' ' ')"; return 1; }
 }
 
 identity_check() { # 设置的用户列表只有管理员看得见，页面上有主人邮箱和 Admin 徽标
