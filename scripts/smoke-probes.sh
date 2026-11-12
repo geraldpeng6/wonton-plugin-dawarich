@@ -1,61 +1,194 @@
 # shellcheck shell=bash
-# scripts/smoke.sh 的一项一项探测，跟着插件走。没写的项会 FAIL 并给出写法，不会默认放行。
-#
-# 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
-# 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
-#
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
-#
-# 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# scripts/smoke.sh 的一项一项探测。页面特征、身份、数据都走真实的应用接口。
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
-
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+# 源地址（scheme://host:port）：真实冒烟（e2e/smoke.sh）给的是 SMOKE_WEB_URL（网页入口
+# 完整地址，含路径），模板 dev 探针给的是 SMOKE_WEB_ORIGIN；后者没有就从前者切。
+# 探针文件被 source 时这两个变量可能都还没设（框架是逐项探测时才注入的），所以现取现用。
+_smoke_origin() {
+  if [[ -n "${SMOKE_WEB_ORIGIN:-}" ]]; then
+    printf '%s' "$SMOKE_WEB_ORIGIN"
+    return
+  fi
+  local tail="${SMOKE_WEB_URL#*://}"
+  printf '%s' "${SMOKE_WEB_URL%%"$tail"}${tail%%/*}"
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+# 页面：SSO 登录后落到应用的时间线/地图页，标题带 Dawarich。
+web_assert() { grep -qi '<title>[^<]*dawarich'; }
+
+# GET 页面：带会话、把 Set-Cookie 写回会话文件。不用框架的 dweb——各冒烟实现里它不一定
+# 写回 cookie，而登录表单的 CSRF 令牌跟着会话走，取表单的请求必须把新会话存下来。
+_fetch_page() {
+  curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+    -H 'Accept: text/html' "$(_smoke_origin)$1"
+}
+
+# 工具：上游自带的只读 MCP。get_latest_location 空库时也返回 {"point":null}，不依赖数据。
+# 工具名带全前缀（总线用清单 id 换成连字符的 slug），不依赖框架给的插件前缀变量。
+export MCP_TOOL=app-dawarich-dawarich__get_latest_location
+export MCP_ARGS={}
+
+mcp_assert() {
+  grep -q '"point"' && ! grep -q '"isError":true'
+}
+
+# 框架的默认 mcp_check 在 e2e 里跑不通，SMOKE_MCP_URL/SMOKE_SLUG 也不在它的变量契约里；
+# 这里按标签找 Hermes 的 gateway 容器（e2e 一定装了 Hermes），用它的总线地址真实调一次。
+# scripts/mcp_client.py 是开发套件随仓库带的 MCP 客户端，gateway 镜像里有它要的 SDK。
+mcp_check() {
+  local gw url out
+  gw="$(docker ps --filter "label=wonton.instance=${SMOKE_INSTANCE:-}" --format '{{.Names}}' \
+    | grep -F "com-nousresearch-hermes--gateway" | head -1)"
+  [[ -n "$gw" ]] || { echo "找不到 Hermes 的 gateway 容器（wonton.instance=${SMOKE_INSTANCE:-}）"; return 1; }
+  url="$(docker exec "$gw" printenv WONTON_MCP_URL 2>/dev/null)" ||
+    { echo "gateway 容器（$gw）里没有 WONTON_MCP_URL"; return 1; }
+  out="$(docker exec -i "$gw" python3 - call "$url" "$MCP_TOOL" "$MCP_ARGS" \
+    <"$(dirname "${BASH_SOURCE[0]}")/mcp_client.py" 2>&1)" ||
+    { echo "调用只读工具 $MCP_TOOL 失败：$(head -c 300 <<<"$out" | tr '\n' ' ')"; return 1; }
+  mcp_assert <<<"$out" ||
+    { echo "$MCP_TOOL 的结果不符合预期：$(head -c 200 <<<"$out" | tr '\n' ' ')"; return 1; }
+}
+
+identity_check() { # 设置的用户列表只有管理员看得见，页面上有主人邮箱和 Admin 徽标
+  local page
+  page="$(_authorized_page /settings/users)" || { echo "${page:-页面失败}"; return 1; }
+  grep -qF "${SMOKE_OWNER}@" <<<"$page" ||
+    { echo "用户列表没显示主人邮箱（${SMOKE_OWNER}@…）：$(head -c 150 <<<"$page")"; return 1; }
+  grep -q '>Admin<' <<<"$page" ||
+    { echo "用户列表里没有 Admin 徽标：$(head -c 150 <<<"$page")"; return 1; }
+}
+
+# 应用会话经 OIDC 建立后才有效。冒烟框架默认的 web_login 只走到应用登录页；
+# omniauth 2.x 的 OIDC 请求段只收 POST，这里补上提交表单、跟完跳转链这一段。
+web_login() {
+  local page
+  page="$(_fetch_page /settings/users)" || { echo "页面请求失败：/settings/users"; return 1; }
+  grep -q 'action="/users/auth/openid_connect"' <<<"$page" || return 0 # 已有应用会话
+  _app_sso_login
+}
+
+# 应用会话要经 OIDC 建立过才有。omniauth 2.x 的 OIDC 请求段只收 POST，核心的 --sso 自动表单
+# 会撞上排在前面、字段为空的邮箱登录表单，所以这里自己解析按钮表单提交，再跟完跳转链。
+_authorized_page() {
+  local page
+  page="$(_fetch_page "$1")" || { echo "页面失败：$1"; return 1; }
+  if grep -q 'action="/users/auth/openid_connect"' <<<"$page"; then
+    _app_sso_login || return 1
+    page="$(_fetch_page "$1")" || { echo "页面失败：$1"; return 1; }
+  fi
+  printf '%s' "$page"
+}
+
+# 标准输入是页面：输出第一个（可选 $1 匹配 action 子串）自动提交型 POST 表单的 urlencoded 字段。
+# 只认字段全是 hidden 的表单：跳转链上要跟的是无 JS 就不动的自动提交表单；
+# 应用页面上的普通表单（有文本框、按钮的）不能抓来重发。
+_form_post_data() {
+  python3 -c '
+import html.parser, sys
+from urllib.parse import urlencode
+
+want = sys.argv[1] if len(sys.argv) > 1 else ""
+
+class Forms(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.cur = None
+        self.forms = []
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form" and self.cur is None:
+            self.cur = {"action": a.get("action", ""), "method": a.get("method", "get").lower(), "fields": [], "extra": False}
+        elif tag == "input" and self.cur is not None and a.get("name"):
+            if a.get("type", "text").lower() == "hidden":
+                self.cur["fields"].append((a["name"], a.get("value", "")))
+            else:
+                self.cur["extra"] = True
+        elif tag in ("select", "textarea") and self.cur is not None:
+            self.cur["extra"] = True
+        elif tag == "button" and self.cur is not None and not want:
+            # 裸调用（跟跳转链）只要纯 hidden 的自动提交表单；显式给了 action 子串才认带按钮的表单
+            # （登录页的 OIDC 入口表单有按钮，登出之类的表单不能抓来重发）。
+            self.cur["extra"] = True
+    def handle_endtag(self, tag):
+        if tag == "form" and self.cur is not None:
+            self.forms.append(self.cur)
+            self.cur = None
+
+p = Forms()
+p.feed(sys.stdin.read())
+for f in p.forms:
+    if f["method"] == "post" and f["fields"] and not f["extra"] and want in f["action"]:
+        print(urlencode(f["fields"]))
+        break
+' "${1:-}"
+}
+
+_app_sso_login() { # 提交登录页的 OIDC 按钮表单（CSRF），跟完 hydra 的跳转链；链上遇到隐藏字段自动表单就照提交。
+  local page form out url
+  for _attempt in 1 2; do
+    page="$(_fetch_page /users/sign_in)" || { echo "登录页请求失败"; return 1; }
+    form="$(_form_post_data '/users/auth/openid_connect' <<<"$page")"
+    [[ -n "$form" ]] || { echo "登录页上没有 OIDC 表单"; return 1; }
+    url="$(_smoke_origin)/users/auth/openid_connect"
+    for _ in 1 2 3 4 5 6 7 8; do
+      out="$(curl -sS --noproxy '*' -m 60 -L -b "$SMOKE_JAR" -c "$SMOKE_JAR" \
+        -H 'Accept: text/html' --data "$form" -w '\n%{url_effective}' "$url")" ||
+        { echo "OIDC 跳转请求失败"; return 1; }
+      url="${out##*$'\n'}"
+      page="${out%$'\n'*}"
+      form="$(_form_post_data <<<"$page")"
+      [[ -n "$form" ]] || break
+    done
+    grep -qi '<title>[^<]*dawarich' <<<"$page" && return 0
+    # 跳转链偶尔会撞上一次性的状态（再走一遍是全新会话），最后一遍的报错才作数。
+    ((_attempt < 2)) || { echo "OIDC 登录没落到应用页面：$(head -c 150 <<<"$page" | tr '\n' ' ')"; return 1; }
+  done
+}
+
+# 数据：按设置里主人那行的接口密钥调应用自己的 API（过网关带核心会话 cookie）。
+# data_write 写一个带随机标记（device_id）的点，data_check 从 points 列表里找回这个标记。
+_owner_page() { # 主人在用户列表里的详情页（接口密钥在这里）
+  local index url
+  index="$(_authorized_page /settings/users)" || { echo "$index"; return 1; }
+  url="$(SMOKE_OWNER="${SMOKE_OWNER:-}" python3 -c '
+import os, re, sys
+t = sys.stdin.read()
+owner = os.environ.get("SMOKE_OWNER", "")
+m = re.search(r"href=\"(/settings/users/\d+)\"[^>]*>[^<]*" + re.escape(owner) + "@", t)
+print(m.group(1) if m else "")
+' <<<"$index")"
+  [[ -n "$url" ]] || { echo "用户列表里找不到主人（${SMOKE_OWNER}@…）"; return 1; }
+  _fetch_page "$url"
+}
+
+_api_key() {
+  local page key
+  page="$(_owner_page)" || { echo "$page"; return 1; }
+  key="$(grep -o 'data-clipboard-text-value="[^"]*"' <<<"$page" | head -1 | sed 's/.*="//; s/"$//')"
+  [[ "$key" =~ ^[0-9a-f]{32,128}$ ]] || { echo "主人页上取不到接口密钥：$(head -c 150 <<<"$page")"; return 1; }
+  printf '%s' "$key"
+}
+
+data_write() {
+  local key marker lat lon body code
+  key="$(_api_key)" || { echo "$key"; return 1; }
+  marker="wontonsmoke${RANDOM}${RANDOM}"
+  lat="55.0${RANDOM}1"
+  lon="12.6${RANDOM}2"
+  body="$(printf '{"locations":[{"type":"Feature","geometry":{"type":"Point","coordinates":[%s,%s]},"properties":{"timestamp":1700000123,"device_id":"%s"}}]}' "$lon" "$lat" "$marker")"
+  code="$(curl -sS --noproxy '*' -m 30 -b "$SMOKE_JAR" -H 'Content-Type: application/json' -d "$body" \
+    -o /dev/null -w '%{http_code}' "$(_smoke_origin)/api/v1/points?api_key=$key")" ||
+    { echo "请求失败：$code"; return 1; }
+  [[ "$code" == 2* ]] || { echo "写点失败：POST /api/v1/points 返回 $code"; return 1; }
+  printf '%s' "$marker" >"$SMOKE_STATE"
+}
+
+data_check() {
+  local key marker
+  key="$(_api_key)" || { echo "$key"; return 1; }
+  marker="$(cat "$SMOKE_STATE")"
+  [[ -n "$marker" ]] || { echo "标记为空"; return 1; }
+  curl -sS --noproxy '*' -m 30 -b "$SMOKE_JAR" \
+    "$(_smoke_origin)/api/v1/points?api_key=$key&per_page=10000" | grep -qF "$marker" ||
+    { echo "points 列表里没有标记 $marker"; return 1; }
+}
